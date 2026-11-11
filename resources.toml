@@ -1,0 +1,335 @@
+# =============================================================================
+# GTA:SA -> NDS asset build configuration (tools/assets.py)
+#
+#   python3 tools/assets.py sync      # copy what's needed from the PC install to game/
+#   python3 tools/assets.py build     # game/ -> nitrofs/  (cached, only changed entries rebuild)
+#   python3 tools/assets.py report    # size per section vs budget
+#   make assets / make                # same, from the Makefile
+#
+# Params resolve as: [defaults.<handler>] -> [<section>.<handler>] -> matching
+# [[<section>.rule]] (in order) -> [global] multipliers.
+#
+# Handlers (by file extension): texture (.txd), model (.dff), collision (.col),
+# anim (.ifp), audio (sfx banks / streams). Anything else is copied verbatim.
+#
+# Rule keys:
+#   match       = glob(s) on the entry name (e.g. "infernus.dff", "radar*.txd")
+#   match_ide   = IDE file(s) under game/; matches the .dff/.txd names they declare
+#   match_texture = glob(s) on texture names inside matching TXDs (texture params only)
+#   remove      = true/false
+#   texture / model / collision / anim / audio = { param overrides }
+# Section keys: kind, enabled, src, out, remove = [globs], keep = [globs]
+# =============================================================================
+
+[global]
+source = "game"
+game_dir = "game"
+out_dir = "nitrofs"
+cache_dir = "build/assets_cache"
+jobs = 0                  # 0 = all cores
+budget_mb = 448           # DS cart max is 512MB; leave room for code + overlays
+# Global compression knobs, multiplied into every section. Quick way to try
+# "everything smaller/bigger" without touching the rest.
+texture_scale = 1.0       # * texture.scale
+model_ratio = 1.0         # * model.ratio and collision.face_ratio
+audio_rate_scale = 1.0    # * audio.sample_rate
+
+# -----------------------------------------------------------------------------
+# Defaults per handler
+# -----------------------------------------------------------------------------
+[defaults.texture]
+scale = 0.5               # resize factor (rounded down to power of two)
+max_size = 128            # clamp per side (DS: 8..1024, VRAM for textures is 256KB with A+B)
+min_size = 8
+format = "auto"           # auto | pal4 | pal16 | pal256 | a3i5 | a5i3 | direct
+auto_colors = 16          # palette used by "auto" for opaque/1-bit alpha textures: 16 or 256
+alpha_threshold = 24      # alpha <= t is transparent, >= 255-t opaque; in between = translucent (a3i5)
+opaque = false            # ignore alpha entirely
+
+[defaults.model]
+ratio = 0.5               # target triangle ratio after decimation (1.0 = untouched)
+min_tris = 64             # never decimate below this
+max_tris = 0              # hard cap per geometry (0 = none). DS limit: 2048 polys per FRAME
+decimate = "cluster"      # cluster (fast vertex clustering) | qem (quadric half-edge collapses: open/UV-seam
+                          # verts locked, same-bone collapses only; slower, much better, crack-free seams)
+                          # | wedge (quadric collapses on the welded mesh, seams only wedge-to-wedge: UVs stay exact)
+uvs = true
+normals = false           # map geometry is prelit, normals only cost space
+vertex_colors = true      # prelit colors (RGB15)
+skin = true               # keep skin (dominant bone per vertex + inverse bind matrices)
+drop_damage = true        # drop *_dam frames (vehicle damage parts)
+drop_vlo = true           # drop *_vlo frames (vehicle low-LOD parts)
+drop_frames = []          # extra frame-name globs to drop
+
+[defaults.collision]
+mode = "full"             # full | simple (decimate faces) | bounds (spheres+boxes only)
+face_ratio = 0.5          # for mode = simple
+min_faces = 16
+
+[defaults.anim]
+keep_every = 2            # keep 1 of every N keyframes (first/last always kept)
+max_frames = 0            # cap keyframes per bone (0 = none)
+drop_translation = false  # drop translation on non-root bones
+remove = []               # anim-name globs to drop inside IFPs
+
+[defaults.audio]
+sample_rate = 11025       # target Hz (never upsamples)
+format = "adpcm"          # adpcm (4bit) | pcm8 | pcm16
+max_seconds = 0           # truncate each sound (0 = no limit)
+volume = 1.0
+
+# -----------------------------------------------------------------------------
+# Streamed world archive: map objects, vehicles, peds, weapons, radar, collision
+# -----------------------------------------------------------------------------
+[gta3_img]
+kind = "img"
+src = "models/gta3.img"
+out = "models/gta3.dspk"
+remove = []
+
+[[gta3_img.rule]]         # vehicles: low poly, small textures, lit (normals). *_dam parts are kept:
+match_ide = "data/vehicles.ide"   # the runtime swaps ok -> dam per panel (CDamageManager)
+model = { ratio = 0.25, min_tris = 24, max_tris = 320, normals = true, drop_damage = false }
+texture = { max_size = 64 }
+
+[[gta3_img.rule]]         # peds: one skinned mesh each, tinted by the ped light like CJ (no normals); ~270 tris
+match_ide = "data/peds.ide"     # (~135 drawn): src/game/pedmodel.cpp, a crowd has to fit next to the map
+# wedge: clustering averaged UVs across islands (flat-coloured peds), qem stalls at ~700 (seams locked)
+model = { ratio = 0.25, max_tris = 300, normals = false, decimate = "wedge" }
+texture = { max_size = 64 }
+
+[[gta3_img.rule]]         # weapons / pickups
+match_ide = "data/default.ide"
+model = { ratio = 0.5, max_tris = 200, normals = true }
+texture = { max_size = 32 }
+
+[[gta3_img.rule]]         # radar tiles: pre-baked into models/radar.dsrt (see [radar])
+match = "radar[0-9]*.txd"
+remove = true
+
+[[gta3_img.rule]]         # map objects (streamed world, see [world]): the DS draws ~1500 polys
+match_ide = "data/maps/**/*.ide"   # per frame for everything, so buildings get very few tris;
+# min_area: clustering alone punched holes into ground/road meshes (sky showing through);
+# ground_qem: mostly-flat meshes use crack/hole-free quadric collapses (borders locked) instead
+model = { ratio = 0.25, min_tris = 12, max_tris = 192, min_area = 0.85, max_shift = 0.5, ground_qem = true }
+texture = { max_size = 32 }   # ~200 textures in view around Grove Street: 64px would not fit VRAM
+
+[[gta3_img.rule]]         # ground surfaces fill the screen: keep them sharper
+match_ide = "data/maps/**/*.ide"
+match_texture = ["*road*", "*pave*", "*sidew*", "*grass*", "*dirt*", "*conc*", "*tar*", "*kerb*", "*curb*"]
+texture = { max_size = 64 }
+
+[[gta3_img.rule]]         # LOD models are seen from far away only
+match = "lod*.dff"
+model = { ratio = 0.3 }
+texture = { max_size = 32 }
+
+[[gta3_img.rule]]
+match = "*.col"
+collision = { mode = "simple", face_ratio = 0.5 }
+
+[[gta3_img.rule]]         # shadows / light coronas inside any TXD
+match_texture = ["*shad*", "*corona*"]
+texture = { max_size = 32 }
+
+# -----------------------------------------------------------------------------
+# Map placement: gta.dat IDE/IPL (+ binary stream IPLs from gta3.img) baked into
+# a sector grid of fixed-point instances (src/game/world.cpp streams it).
+[world]
+kind = "world"
+out = "data/world.dwld"
+dat = "data/gta.dat"
+img = "models/gta3.img"
+sector = 50               # sector size in metres
+lods = true               # Stream distant LODs; switch from HD at 100 m when both models are ready
+# bounds = [2150, -1950, 2850, -1400]   # Optional local map crop; no bounds streams all of San Andreas
+
+[entry_exits]
+kind = "entry_exits"
+out = "data/entry_exits.denx"
+
+# Vehicle definitions: vehicles.ide + handling.cfg (game units) + carcols.dat +
+# surface adhesion (surface.dat / surfinfo.dat) in one table (src/game/vehicledata.cpp).
+[vehicles]
+kind = "vehicles"
+out = "data/vehicles.dveh"
+
+# Ped population: peds.ide / pedstats / pedgrp / popcycle / animgrp tables, the ped path
+# global ped/road path nodes and main.scm's new-game zone setup (src/game/peddata.cpp).
+[peds]
+kind = "peds"
+out = "data/peds.dped"
+
+# -----------------------------------------------------------------------------
+[gta_int_img]             # interiors
+kind = "img"
+src = "models/gta_int.img"
+out = "models/gta_int.dspk"
+texture = { scale = 0.5, max_size = 64 }
+model = { ratio = 0.4 }
+
+[player_img]              # CJ clothes / body parts
+kind = "img"
+src = "models/player.img"
+out = "models/player.dspk"
+texture = { max_size = 64 }
+# qem: the parts are assembled at runtime, so seams (neck, wrists, waist) must
+# stay bit-exact or CJ shows cracks; clustering moved seam verts up to 10cm.
+model = { ratio = 0.5, normals = true, decimate = "qem" }
+
+[radar]                   # bottom-screen radar: 12x12 radarNN.txd -> RGB15 64px tiles + 32px mips,
+kind = "radar"            # fixed-stride records streamed on demand by src/game/hud/radar.cpp
+src = "models/gta3.img"
+out = "models/radar.dsrt"
+grid = 12
+
+[map_points]
+kind = "points"
+out = "data/map_points.dpoi"
+
+[anim_img]                # streamed anim blocks (DANM v2: per-clip directory, streamed per clip)
+kind = "img"
+src = "anim/anim.img"
+out = "anim/anim.dspk"
+
+[ped_ifp]                 # base ped animations (always resident)
+kind = "files"
+src = ["anim/ped.ifp"]
+out = ""
+
+[cutscene_files]
+kind = "files"
+src = ["anim/cuts/*.ifp", "anim/cuts/*.dat", "anim/cuts/*.cut"]
+from_img = "anim/cuts.img"
+names = ["prolog1", "prolog3", "intro1a", "intro1b"]
+out = ""
+anim = { keep_every = 4, rigid_clips = ["csgizmo", "cshandcuff", "csmoneystck"] }
+
+[cutscene_models]
+kind = "files"
+src = ["models/cutscene/*.dff", "models/cutscene/*.txd"]
+from_img = "models/cutscene.img"
+extract_to = "models/cutscene"
+names = ["csbogman", "csstew", "cssuitcase", "cstaxi92", "cspulaski", "cshernandez", "cstenpenny", "cs9mm", "cscopcarla92", "csgizmo", "cshandcuff", "csmoneystck"]
+suffixes = [".dff", ".txd"]
+keep_paths = false
+pack = "models/cutscene.dspk"
+model = { ratio = 0.28, max_tris = 440, normals = false }
+texture = { max_size = 64 }
+
+[[cutscene_models.rule]]
+match = ["*/csgizmo.dff", "*/cshandcuff.dff", "*/csmoneystck.dff"]
+model = { rigid_skin = true }
+
+[[cutscene_models.rule]]
+match = ["*/cstaxi92.dff", "*/cscopcarla92.dff"]
+model = { ratio = 0.24, min_tris = 16, max_tris = 96 }
+
+[models_loose]            # HUD, fonts, frontend, particles, generic, grass, base collisions
+kind = "files"
+src = ["models/*.txd", "models/generic/*", "models/grass/*", "models/coll/*.col", "models/txd/*.txd", "models/effects.fxp"]
+out = ""
+remove = ["*btns.txd", "*sixaxis.txd", "models/txd/intro*"]
+
+[[models_loose.rule]]     # font textures: a3i5 glyphs at 256x256 (512 would not fit VRAM)
+match = "models/fonts.txd"
+texture = { scale = 0.5, max_size = 256 }
+
+[[models_loose.rule]]     # HUD textures go to the 2D sub engine: keep them crisp
+match = "models/hud.txd"
+texture = { scale = 1.0, max_size = 256 }
+
+[[models_loose.rule]]     # frontend menu art
+match = "models/fronten*.txd"
+texture = { scale = 0.5, max_size = 256, auto_colors = 256 }
+
+[[models_loose.rule]]     # loading screen artwork: drawn fullscreen
+match = "models/txd/loadsc*.txd"
+texture = { scale = 0.5, max_size = 256, auto_colors = 256 }
+
+[[models_loose.rule]]
+match = "models/particle.txd"
+texture = { max_size = 32 }
+
+[[models_loose.rule]]     # generic vehicle textures (txd parent of every vehicle txd)
+match = "models/generic/vehicle.txd"
+texture = { max_size = 32 }
+
+[[models_loose.rule]]     # body panels fill a lot of the screen when driving
+match = "models/generic/vehicle.txd"
+match_texture = ["vehiclegrunge256", "vehiclegeneric256", "vehiclelights*"]
+texture = { max_size = 64 }
+
+[[models_loose.rule]]     # sky sprites drawn additively on PC: luminance -> alpha (a5i3), see render/sky.cpp
+match = "models/particle.txd"
+match_texture = ["coronastar", "coronamoon", "cloud1"]
+texture = { max_size = 32, format = "a5i3", additive = true }
+
+# -----------------------------------------------------------------------------
+[data]                    # IDE/IPL/DAT/handling/scm: copied verbatim
+kind = "copy"
+src = ["data/**/*"]
+out = ""
+remove = ["data/icons/*", "*.ico", "*.bmp", "audioevents.txt"]
+
+[text]
+kind = "copy"
+src = ["text/american.gxt", "text/spanish.gxt"]
+out = ""
+
+# -----------------------------------------------------------------------------
+# Audio. SFX paks: FEET GENRL PAIN_A SCRIPT (mission dialogue) SPC_EA SPC_FA
+# SPC_GA SPC_NA (ped speech) SPC_PA (player speech).
+# -----------------------------------------------------------------------------
+[audio_sfx]
+kind = "sfx"
+src = "audio"
+out = "audio/sfx"
+remove = ["SPC_EA", "SPC_FA", "SPC_GA", "SPC_NA"]
+audio = { sample_rate = 11025, format = "adpcm" }
+
+[[audio_sfx.rule]]
+match = "SCRIPT"
+audio = { sample_rate = 8000 }
+
+[audio_config]            # EventVol.dat: default dB per audio event (CAEAudioEntity::GetDefaultVolume)
+kind = "copy"
+src = ["audio/CONFIG/EventVol.dat"]
+out = ""
+
+# Streams: AA (misc), ADVERTS, AMBIENCE, BEATS (dance/lowrider minigames),
+# CUTSCENE, and radio stations: CH Playback FM, CO K-Rose, CR K-DST,
+# DS Bounce FM, HC SF-UR, MH Radio Los Santos, MR Radio X, NJ CSR 103.9,
+# RE K-Jah West, RG Master Sounds 98.3, TK WCTR.
+[audio_streams]
+kind = "streams"
+src = "audio"
+out = "audio/streams"
+remove = ["ADVERTS", "BEATS", "CH", "CO", "CR", "DS", "HC", "MH", "MR", "NJ", "RE", "RG", "TK"]
+audio = { sample_rate = 16000, format = "adpcm" }
+
+[[audio_streams.rule]]
+match = "CUTSCENE"
+audio = { sample_rate = 11025, track_ids = [706, 708] }
+
+# Example: enable one radio with a few tracks at lower quality
+# [[audio_streams.rule]]
+# match = "MH"
+# remove = false
+# audio = { sample_rate = 11025, max_tracks = 10 }
+
+[radio_streams]
+kind = "streams"
+sd_only = true
+src = "audio"
+lookup_dir = "radio_config"
+out = "audio/streams"
+keep = ["CH", "CO", "CR", "DS", "HC", "MH", "MR", "NJ", "RE", "RG", "TK"]
+audio = { sample_rate = 11025, format = "adpcm", seekable = true }
+
+[movies]                  # intro/logo videos -> DVID frames + PCM16 audio
+kind = "intro"
+src = ["movies/Logo.mpg", "movies/GTAtitles.mpg"]
+fps = 10
+audio_rate = 22050
+out = "movies"
