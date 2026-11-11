@@ -12,7 +12,6 @@ env:
   #   GTA_SA_ASSETS_URL   — прямая ссылка на zip/7z/tar.gz (Google Drive ?export=download,
   #                         Dropbox ?dl=1, S3 presigned, любой прямой https)
   #   GTA_SA_ASSETS_TOKEN — опционально, Bearer-токен для авторизации
-  # Если архив больше 2 ГБ — разбей на части и укажи несколько URL через пробел.
   ASSETS_URL: ${{ secrets.GTA_SA_ASSETS_URL }}
   ASSETS_TOKEN: ${{ secrets.GTA_SA_ASSETS_TOKEN }}
 
@@ -23,6 +22,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Fix Makefile source discovery (repo layout)
+        run: |
+          set -e
+          # В этом репо main.cpp лежит в корне, а исходники разбросаны по
+          # Hud/, mem/, rendeR/ и т.д. Makefile же ищет всё только в src/.
+          # ПравИм Makefile: собирать исходники из корня рекурсивно.
+          sed -i 's|^SOURCES  :=.*|SOURCES  := .|' Makefile
+          sed -i 's|^INCLUDES :=.*|INCLUDES := .|' Makefile
+          echo "=== Makefile после правки ==="
+          grep -nE '^(SOURCES|INCLUDES)' Makefile
 
       - name: Install devkitPro toolchain (devkitARM + libnds)
         run: |
@@ -36,14 +46,12 @@ jobs:
 
       - name: Setup build environment
         run: |
-          # /etc/profile.d/devkitpro.sh не гарантирован и не загружается в CI
-          # (неинтерактивный bash). Пути devkitPro задаём явно, стандарт Linux:
-          # DEVKITPRO=/opt/devkitpro, DEVKITARM=$DEVKITPRO/devkitARM
+          # /etc/profile.d/devkitpro.sh не гарантирован и не загружается в CI.
+          # Пути devkitPro задаём явно (стандарт Linux):
           echo "DEVKITPRO=/opt/devkitpro" >> "$GITHUB_ENV"
           echo "DEVKITARM=/opt/devkitpro/devkitARM" >> "$GITHUB_ENV"
           echo "/opt/devkitpro/tools/bin" >> "$GITHUB_PATH"
           echo "/opt/devkitpro/devkitARM/bin" >> "$GITHUB_PATH"
-          echo "Проверка тулчейна:"
           ls -la /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc && echo "arm-gcc OK"
           ls -la /opt/devkitpro/tools/bin/ndstool && echo "ndstool OK"
 
@@ -60,11 +68,9 @@ jobs:
           set -e
           mkdir -p /tmp/gtasa-src game
 
-          # Части архива (если >2 ГБ) — через пробел: "URL1 URL2"
           i=1
           for url in ${ASSETS_URL}; do
-            ext="${url##*.}"
-            ext="${ext,,}"
+            ext="${url##*.}"; ext="${ext,,}"
             case "${ext}" in
               zip)    f="/tmp/gtasa-assets-${i}.zip" ;;
               7z)     f="/tmp/gtasa-assets-${i}.7z" ;;
@@ -81,7 +87,6 @@ jobs:
             i=$((i+1))
           done
 
-          # Распаковка всех частей в общий каталог
           for f in /tmp/gtasa-assets-*; do
             case "${f}" in
               *.zip)     unzip -q "${f}" -d /tmp/gtasa-src ;;
@@ -91,7 +96,6 @@ jobs:
             esac
           done
 
-          # Найти корень игры и скопировать в game/
           if [ -d /tmp/gtasa-src/game ]; then
             cp -a /tmp/gtasa-src/game/. game/
           elif [ -d /tmp/gtasa-src/models ] && [ -d /tmp/gtasa-src/data ]; then
@@ -101,14 +105,11 @@ jobs:
             if [ -n "${inner}" ]; then
               cp -a "${inner}/." game/
             else
-              echo "::error::Не смог найти корень игры в архиве. Он должен содержать модели/ data/ audio/ text/ anim/."
+              echo "::error::Не смог найти корень игры в архиве. Нужны models/ data/ audio/ text/ anim/."
               exit 1
             fi
           fi
-
-          echo "=== game/ ==="
-          ls game | head -20
-          du -sh game
+          echo "=== game/ ==="; ls game | head -20; du -sh game
 
       - name: Verify game structure
         if: env.ASSETS_URL != ''
@@ -116,7 +117,7 @@ jobs:
           set -e
           for d in models data audio text anim; do
             if [ ! -d "game/$d" ]; then
-              echo "::error::В game/ нет папки $d (нужны: models data audio text anim movies). Архив неполный."
+              echo "::error::В game/ нет папки $d. Архив неполный."
               exit 1
             fi
           done
@@ -145,7 +146,6 @@ jobs:
       - name: Collect outputs
         run: |
           ls -la build/ | grep -E "\.nds|\.dsi" || true
-          echo "=== SD assets ==="
           du -sh build/gtasads 2>/dev/null || echo "no SD asset dir"
 
       - name: Upload NDS/DSi artifacts
