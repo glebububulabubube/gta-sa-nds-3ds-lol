@@ -23,6 +23,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Diagnose repo sources (what is actually committed)
+        run: |
+          echo "=== ВСЕ файлы .cpp/.h в репо (полный список) ==="
+          find . -type f \( -name '*.cpp' -o -name '*.h' \) | sort
+          echo ""
+          echo "=== Проверка ключевых файлов, которые нужны линковщику ==="
+          for f in \
+            game/world.cpp game/weather.cpp game/timecycle.cpp game/missions.cpp \
+            game/peds.cpp game/player.cpp game/cutscene.cpp game/vehicle.cpp \
+            game/sfx.cpp game/peddata.cpp game/hud/chud.cpp game/menu/menu.cpp \
+            game/text/gxt.cpp platform/timing.cpp platform/fs.cpp platform/video.cpp \
+            platform/input.cpp render/renderer.cpp rendeR/renderer.cpp hud/hud.cpp \
+            mem/mem.cpp audio/audioengine.cpp; do
+            if [ -f "$f" ]; then
+              echo "  OK:   $f"
+            else
+              echo "  НЕТУ: $f  <-- линковщик будет ругаться на функции из этого файла"
+            fi
+          done
+
       - name: Normalise repo layout for the Makefile
         run: |
           set -e
@@ -33,7 +53,7 @@ jobs:
           [ -d rendeR ] && [ ! -d render ] && mv rendeR render && echo "rendeR -> render"
           [ -d Hud ] && [ ! -d hud ] && mv Hud hud && echo "Hud -> hud"
 
-          # Makefile ищет исходники в src/ — собираем из корня рекурсивно
+          # Makefile в этом репо ищет исходники в src/ — собираем из корня рекурсивно
           sed -i 's|^SOURCES  :=.*|SOURCES  := .|' Makefile
           sed -i 's|^INCLUDES :=.*|INCLUDES := .|' Makefile
 
@@ -41,8 +61,8 @@ jobs:
           mkdir -p game hud mem render platform assets audio tools
 
           # В репо файлы разбросаны: часть в корне, часть в game/.
-          # Дубликаты сломают make ("Duplicate source basenames"), поэтому для
-          # каждого модуля оставляем ОДНУ копию: в game/ (если есть) или из корня.
+          # Дубликаты сломают make ("Duplicate source basenames"), поэтому для каждого
+          # модуля оставляем ОДНУ копию: в game/ (если есть) или переносим из корня.
           for f in \
             anim animstore cj collision cutscene debugopts entryexits fx intro \
             loadscreen melee missions pad pedanim peddata pedmodel pedmove peds \
@@ -70,8 +90,8 @@ jobs:
           [ -f mem.h ]   && [ -f mem/mem.h ]     && rm -f mem.h
           [ -f mem.cpp ] && [ -f mem/mem.cpp ]   && rm -f mem.cpp
 
-          # Проверка дублей имён .cpp/.c/.s (должно быть пусто)
-          echo "=== дубли имён (должно быть пусто) ==="
+          # Проверка, что не осталось дублей имён (иначе make упадёт)
+          echo "=== дубли имён .cpp/.c/.s (должно быть пусто) ==="
           find . -name '*.cpp' -o -name '*.c' -o -name '*.s' | xargs -n1 basename | sort | uniq -d || true
 
           # Критичные папки для main.cpp
