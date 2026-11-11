@@ -29,40 +29,60 @@ jobs:
           echo "=== корень до правок ==="
           ls -la
 
-          # main.cpp инклудит "render/renderer.h" и т.п. — в репо папка названа
-          # "rendeR" (регистр!). На Linux регистр важен, Makefile + компилятор
-          # не найдут "render/". Переименовываем в нижний регистр, если есть.
-          if [ -d rendeR ] && [ ! -d render ]; then
-            mv rendeR render
-            echo "ренеймен rendeR -> render"
-          fi
-          if [ -d Hud ] && [ ! -d hud ]; then
-            mv Hud hud
-            echo "ренеймен Hud -> hud"
-          fi
+          # main.cpp инклудит "render/renderer.h", "platform/fs.h" и т.д.
+          # В репо папки названы с большой буквы (Hud, rendeR) — регистр важен
+          # на Linux. Переименовываем в нижний регистр.
+          if [ -d rendeR ] && [ ! -d render ]; then mv rendeR render; echo "ренеймен rendeR -> render"; fi
+          if [ -d Hud ] && [ ! -d hud ]; then mv Hud hud; echo "ренеймен Hud -> hud"; fi
 
-          # Makefile ищет исходники в src/ — в этом репо их структура иная.
+          # Makefile ищет исходники только в src/ — здесь структура иная.
           # Пусть make собирает из корня рекурсивно.
           sed -i 's|^SOURCES  :=.*|SOURCES  := .|' Makefile
           sed -i 's|^INCLUDES :=.*|INCLUDES := .|' Makefile
 
-          # Проверка, что критичные для main.cpp папки есть
+          # Раскиданные хедеры: world.h/weather.h/vehicle.h/timecycle.h лежат в корне,
+          # а код инклудит их как "game/world.h" и т.п. Копируем недостающие в game/.
+          for f in \
+            anim animstore cj collision cutscene debugopts entryexits fx intro \
+            loadscreen melee missions pad pedanim peddata pedmodel pedmove peds \
+            player sfx skidmarks streaming timecycle vehicle vehicledata vehicleint \
+            vehiclemodel vehphys waterlevel weather world zones; do
+            if [ -f "${f}.h" ] && [ ! -f "game/${f}.h" ]; then
+              cp "${f}.h" "game/${f}.h"
+              echo "в game/ добавлен ${f}.h"
+            fi
+            if [ -f "${f}.cpp" ] && [ ! -f "game/${f}.cpp" ]; then
+              cp "${f}.cpp" "game/${f}.cpp"
+              echo "в game/ добавлен ${f}.cpp"
+            fi
+          done
+
+          # hud.h/hud.cpp — из корня в hud/, mem.h в mem/, и т.д.
+          if [ -f hud.h ] && [ ! -f hud/hud.h ]; then cp hud.h hud/hud.h; echo "hud.h -> hud/"; fi
+          if [ -f hud.cpp ] && [ ! -f hud/hud.cpp ]; then cp hud.cpp hud/hud.cpp; echo "hud.cpp -> hud/"; fi
+          if [ -f mem.h ] && [ ! -f mem/mem.h ]; then cp mem.h mem/mem.h; echo "mem.h -> mem/"; fi
+          if [ -f mem.cpp ] && [ ! -f mem/mem.cpp ]; then cp mem.cpp mem/mem.cpp; echo "mem.cpp -> mem/"; fi
+
+          # Критичные папки для main.cpp
           for d in game hud mem audio platform render assets tools; do
             if [ ! -d "$d" ]; then
               echo "::warning::В репо нет папки $d/ — main.cpp её инклудит. Код неполный."
             fi
           done
-          echo "=== корень после правок ==="
-          ls -la
+          echo "=== game/ после нормализации (ключевые) ==="
+          ls game/ | grep -E "world|weather|vehicle|timecycle|collision" || true
 
       - name: Install devkitPro toolchain (devkitARM + libnds)
         run: |
           set -e
+          # apt.devkitpro.org и pkg.devkitpro.org отдают 403 на дефолтный user-agent
+          # (Cloudflare-защита от ботов, devkitPro issue #62). Фикс: браузерный UA.
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
           wget -U "${UA}" https://apt.devkitpro.org/install-devkitpro-pacman
           chmod +x ./install-devkitpro-pacman
 
-          # 403 на pkg.devkitpro.org чиним через XferCommand с браузерным UA
+          # 403 на pkg.devkitpro.org чиним через XferCommand (curl + браузерный UA)
           sudo ./install-devkitpro-pacman || true
           if [ -f /opt/devkitpro/pacman/etc/pacman.conf ] && ! grep -q "XferCommand" /opt/devkitpro/pacman/etc/pacman.conf 2>/dev/null; then
             sudo sed -i '/^\[options\]/a XferCommand = /usr/bin/curl -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" -o %o %u' /opt/devkitpro/pacman/etc/pacman.conf
@@ -70,6 +90,7 @@ jobs:
           sudo dpkg --configure -a || true
           sudo dkp-pacman -Sy --noconfirm || sudo dkp-pacman -Sy --noconfirm
           sudo dkp-pacman -S --noconfirm nds-dev
+
           ls /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc && echo "arm-gcc OK"
           ls /opt/devkitpro/tools/bin/ndstool && echo "ndstool OK"
 
@@ -92,6 +113,8 @@ jobs:
         run: |
           set -e
           mkdir -p /tmp/gtasa-src game
+
+          # Части архива (если >2 ГБ) — через пробел: "URL1 URL2"
           i=1
           for url in ${ASSETS_URL}; do
             ext="${url##*.}"; ext="${ext,,}"
@@ -101,6 +124,7 @@ jobs:
               gz|tgz) f="/tmp/gtasa-assets-${i}.tar.gz" ;;
               *)      f="/tmp/gtasa-assets-${i}.bin" ;;
             esac
+            echo "скачиваю: ${url} -> ${f}"
             if [ -n "${ASSETS_TOKEN}" ]; then
               curl -fL --retry 3 --output "${f}" -H "Authorization: Bearer ${ASSETS_TOKEN}" "${url}"
             else
@@ -109,6 +133,8 @@ jobs:
             ls -lh "${f}"
             i=$((i+1))
           done
+
+          # Распаковка всех частей в общий каталог
           for f in /tmp/gtasa-assets-*; do
             case "${f}" in
               *.zip)     unzip -q "${f}" -d /tmp/gtasa-src ;;
@@ -117,6 +143,8 @@ jobs:
               *)         echo "неизвестный формат: ${f}"; exit 1 ;;
             esac
           done
+
+          # Найти корень игры и скопировать в game/
           if [ -d /tmp/gtasa-src/game ]; then
             cp -a /tmp/gtasa-src/game/. game/
           elif [ -d /tmp/gtasa-src/models ] && [ -d /tmp/gtasa-src/data ]; then
