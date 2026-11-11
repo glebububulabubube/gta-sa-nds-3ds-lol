@@ -1,1 +1,180 @@
-М
+name: build
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Приватный архив файлов оригинальной GTA:SA (4 ГБ), скачивается в CI.
+  # Положить в Settings -> Secrets and variables -> Actions:
+  #   GTA_SA_ASSETS_URL   — прямая ссылка на zip/7z/tar.gz (Google Drive ?export=download,
+  #                         Dropbox ?dl=1, S3 presigned, любой прямой https)
+  #   GTA_SA_ASSETS_TOKEN — опционально, Bearer-токен для авторизации
+  ASSETS_URL: ${{ secrets.GTA_SA_ASSETS_URL }}
+  ASSETS_TOKEN: ${{ secrets.GTA_SA_ASSETS_TOKEN }}
+
+jobs:
+  build-full:
+    name: Full NDS build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalise repo layout for the Makefile
+        run: |
+          set -e
+          echo "=== корень до правок ==="
+          ls -la
+
+          # main.cpp инклудит "render/renderer.h" и т.п. — в репо папка названа
+          # "rendeR" (регистр!). На Linux регистр важен, Makefile + компилятор
+          # не найдут "render/". Переименовываем в нижний регистр, если есть.
+          if [ -d rendeR ] && [ ! -d render ]; then
+            mv rendeR render
+            echo "ренеймен rendeR -> render"
+          fi
+          if [ -d Hud ] && [ ! -d hud ]; then
+            mv Hud hud
+            echo "ренеймен Hud -> hud"
+          fi
+
+          # Makefile ищет исходники в src/ — в этом репо их структура иная.
+          # Пусть make собирает из корня рекурсивно.
+          sed -i 's|^SOURCES  :=.*|SOURCES  := .|' Makefile
+          sed -i 's|^INCLUDES :=.*|INCLUDES := .|' Makefile
+
+          # Проверка, что критичные для main.cpp папки есть
+          for d in game hud mem audio platform render assets tools; do
+            if [ ! -d "$d" ]; then
+              echo "::warning::В репо нет папки $d/ — main.cpp её инклудит. Код неполный."
+            fi
+          done
+          echo "=== корень после правок ==="
+          ls -la
+
+      - name: Install devkitPro toolchain (devkitARM + libnds)
+        run: |
+          set -e
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+          wget -U "${UA}" https://apt.devkitpro.org/install-devkitpro-pacman
+          chmod +x ./install-devkitpro-pacman
+
+          # 403 на pkg.devkitpro.org чиним через XferCommand с браузерным UA
+          sudo ./install-devkitpro-pacman || true
+          if [ -f /opt/devkitpro/pacman/etc/pacman.conf ] && ! grep -q "XferCommand" /opt/devkitpro/pacman/etc/pacman.conf 2>/dev/null; then
+            sudo sed -i '/^\[options\]/a XferCommand = /usr/bin/curl -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" -o %o %u' /opt/devkitpro/pacman/etc/pacman.conf
+          fi
+          sudo dpkg --configure -a || true
+          sudo dkp-pacman -Sy --noconfirm || sudo dkp-pacman -Sy --noconfirm
+          sudo dkp-pacman -S --noconfirm nds-dev
+          ls /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc && echo "arm-gcc OK"
+          ls /opt/devkitpro/tools/bin/ndstool && echo "ndstool OK"
+
+      - name: Setup build environment
+        run: |
+          echo "DEVKITPRO=/opt/devkitpro" >> "$GITHUB_ENV"
+          echo "DEVKITARM=/opt/devkitpro/devkitARM" >> "$GITHUB_ENV"
+          echo "/opt/devkitpro/tools/bin" >> "$GITHUB_PATH"
+          echo "/opt/devkitpro/devkitARM/bin" >> "$GITHUB_PATH"
+
+      - name: Check Python / ffmpeg
+        run: |
+          python3 --version
+          ffmpeg -version | head -1
+
+      # --- Полная сборка: когда задан секрет с архивом файлов игры --------------
+
+      - name: Fetch game assets (private archive via secrets)
+        if: env.ASSETS_URL != ''
+        run: |
+          set -e
+          mkdir -p /tmp/gtasa-src game
+          i=1
+          for url in ${ASSETS_URL}; do
+            ext="${url##*.}"; ext="${ext,,}"
+            case "${ext}" in
+              zip)    f="/tmp/gtasa-assets-${i}.zip" ;;
+              7z)     f="/tmp/gtasa-assets-${i}.7z" ;;
+              gz|tgz) f="/tmp/gtasa-assets-${i}.tar.gz" ;;
+              *)      f="/tmp/gtasa-assets-${i}.bin" ;;
+            esac
+            if [ -n "${ASSETS_TOKEN}" ]; then
+              curl -fL --retry 3 --output "${f}" -H "Authorization: Bearer ${ASSETS_TOKEN}" "${url}"
+            else
+              curl -fL --retry 3 --output "${f}" "${url}"
+            fi
+            ls -lh "${f}"
+            i=$((i+1))
+          done
+          for f in /tmp/gtasa-assets-*; do
+            case "${f}" in
+              *.zip)     unzip -q "${f}" -d /tmp/gtasa-src ;;
+              *.7z)      sudo apt-get install -y -qq p7zip-full >/dev/null 2>&1; 7z x -y -o/tmp/gtasa-src "${f}" >/dev/null ;;
+              *.tar.gz)  tar -xzf "${f}" -C /tmp/gtasa-src ;;
+              *)         echo "неизвестный формат: ${f}"; exit 1 ;;
+            esac
+          done
+          if [ -d /tmp/gtasa-src/game ]; then
+            cp -a /tmp/gtasa-src/game/. game/
+          elif [ -d /tmp/gtasa-src/models ] && [ -d /tmp/gtasa-src/data ]; then
+            cp -a /tmp/gtasa-src/. game/
+          else
+            inner=$(find /tmp/gtasa-src -mindepth 1 -maxdepth 1 -type d | head -1)
+            if [ -n "${inner}" ]; then
+              cp -a "${inner}/." game/
+            else
+              echo "::error::Не смог найти корень игры в архиве. Нужны models/ data/ audio/ text/ anim/."
+              exit 1
+            fi
+          fi
+          echo "=== game/ ==="; ls game | head -20; du -sh game
+
+      - name: Verify game structure
+        if: env.ASSETS_URL != ''
+        run: |
+          set -e
+          for d in models data audio text anim; do
+            if [ ! -d "game/$d" ]; then
+              echo "::error::В game/ нет папки $d. Архив неполный."
+              exit 1
+            fi
+          done
+          echo "структура game/ OK"
+
+      - name: Build assets (convert PC -> DS formats)
+        if: env.ASSETS_URL != ''
+        run: |
+          python3 tools/assets.py sync
+          python3 tools/assets.py build -j "$(nproc)"
+          python3 tools/assets.py report
+
+      - name: Build code + ROM (all variants, full assets)
+        if: env.ASSETS_URL != ''
+        run: |
+          make build -j "$(nproc)"
+
+      # --- Режим без секрета: только проверка компиляции кода -------------------
+
+      - name: Build code only (ASSETS=0, no game data provided)
+        if: env.ASSETS_URL == ''
+        run: |
+          make ASSETS=0 build -j "$(nproc)"
+          echo "Секрет GTA_SA_ASSETS_URL не задан — собран только код (без ассетов игры)."
+
+      - name: Collect outputs
+        run: |
+          ls -la build/ | grep -E "\.nds|\.dsi" || true
+          du -sh build/gtasads 2>/dev/null || echo "no SD asset dir"
+
+      - name: Upload NDS/DSi artifacts
+        if: env.ASSETS_URL != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta-sa-ds-rom
+          path: |
+            build/*.nds
+            build/*.dsi
+          if-no-files-found: error
