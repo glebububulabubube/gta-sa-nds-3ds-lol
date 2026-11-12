@@ -107,15 +107,35 @@ jobs:
         run: |
           set -e
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+          XFER='XferCommand = /usr/bin/curl -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" -o %o %u'
+
           wget -U "${UA}" https://apt.devkitpro.org/install-devkitpro-pacman
           chmod +x ./install-devkitpro-pacman
 
-          # 403 на pkg.devkitpro.org чиним через XferCommand (curl + браузерный UA)
+          # Установщик в постинсте сам ходит в pkg.devkitpro.org и падает на 403.
+          # Ставим с || true (пакет останется unpacked, это ок) и правим конфиг.
           sudo ./install-devkitpro-pacman || true
-          if [ -f /opt/devkitpro/pacman/etc/pacman.conf ] && ! grep -q "XferCommand" /opt/devkitpro/pacman/etc/pacman.conf 2>/dev/null; then
-            sudo sed -i '/^\[options\]/a XferCommand = /usr/bin/curl -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" -o %o %u' /opt/devkitpro/pacman/etc/pacman.conf
+
+          # Найти реальный pacman.conf devkitPro (Debian: /opt/devkitpro/pacman/etc/pacman.conf)
+          DKPCONF=""
+          for c in /opt/devkitpro/pacman/etc/pacman.conf /etc/pacman.conf; do
+            if [ -f "$c" ]; then DKPCONF="$c"; break; fi
+          done
+          echo "pacman.conf: ${DKPCONF:-НЕ НАЙДЕН}"
+          if [ -n "$DKPCONF" ]; then
+            # Гарантированно добавляем XferCommand. Если секции [options] нет — создаём
+            # (append в конец файла, что pacman понимает корректно).
+            if ! grep -q '^XferCommand' "$DKPCONF"; then
+              sudo sh -c "printf '\n[options]\n${XFER}\n' >> '$DKPCONF'"
+              echo "XferCommand добавлен в ${DKPCONF}"
+            fi
+            grep '^XferCommand' "$DKPCONF" || echo "::warning::XferCommand не записался"
           fi
+
+          # Донастраиваем пакет: постинст теперь качает базы через curl с браузерным UA
           sudo dpkg --configure -a || true
+
+          # Повторный sync + установка тулчейна
           sudo dkp-pacman -Sy --noconfirm || sudo dkp-pacman -Sy --noconfirm
           sudo dkp-pacman -S --noconfirm nds-dev
 
